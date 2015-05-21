@@ -31,6 +31,10 @@ extern "C" {
 
 #include "php_fixapi.h"
 #include "fixapi.h"
+#define NCF_FIXAPI_HASH_KEY_PATTERN "ncffixapi:%s:%s:%s"
+
+static int le_fixapi_descriptor;
+static int le_fixapi_descriptor_persist;
 
 zend_class_entry *fixapi_FixApi_ce;
 
@@ -40,6 +44,8 @@ BULLSOFT_INIT_FUNCS(fixapi_methods)
 {
 	PHP_ME(FixApi, __construct, NULL, ZEND_ACC_PUBLIC | ZEND_ACC_CTOR)
 	PHP_ME(FixApi, connect, NULL,  ZEND_ACC_PUBLIC | ZEND_ACC_DTOR)
+    PHP_ME(FixApi, isConnected, NULL,  ZEND_ACC_PUBLIC | ZEND_ACC_DTOR)
+	PHP_ME(FixApi, getConnection, NULL,  ZEND_ACC_PUBLIC | ZEND_ACC_DTOR)
 	PHP_FE_END
 };
 
@@ -74,12 +80,49 @@ ZEND_GET_MODULE(fixapi)
 }
 #endif
 
+static void php_fixapi_descriptor_dtor(zend_rsrc_list_entry *rsrc TSRMLS_DC)
+{
+	if(rsrc->ptr != NULL) {
+		php_fixapi_descriptor *fdata = (php_fixapi_descriptor *)rsrc->ptr;
+		// Fix_Close(fdata->handle_conn);
+		efree(fdata->addr);
+		efree(fdata->user);
+		efree(fdata->pwd);
+		fdata = NULL;
+	}
+}
+
+static void php_fixapi_descriptor_dtor_persistent(zend_rsrc_list_entry *rsrc TSRMLS_DC)
+{
+	if(rsrc->ptr != NULL) {
+		php_fixapi_descriptor *fdata = (php_fixapi_descriptor *)rsrc->ptr;
+		// Fix_Close(fdata->handle_conn);
+		pefree(fdata->addr, 1);
+		pefree(fdata->user, 1);
+		pefree(fdata->pwd,  1);
+	}
+}
+
+
 /* {{{ PHP_MINIT_FUNCTION
  */
 PHP_MINIT_FUNCTION(fixapi)
 {
 	BULLSOFT_INIT(fixapi, FixApi);
 	fixapi_FixApi_ce->create_object = create_fixapi_object;
+
+	le_fixapi_descriptor =
+		zend_register_list_destructors_ex(php_fixapi_descriptor_dtor, 
+										  NULL,
+										  PHP_FIXAPI_DESCRIPTOR_RES_NAME,
+										  module_number);
+	
+	le_fixapi_descriptor_persist =
+		zend_register_list_destructors_ex(NULL,
+										  php_fixapi_descriptor_dtor_persistent,
+										  PHP_FIXAPI_DESCRIPTOR_RES_NAME,
+										  module_number);
+	
 	Fix_Initialize();
 	return SUCCESS;
 }
@@ -121,13 +164,8 @@ PHP_MINFO_FUNCTION(fixapi)
 	php_info_print_table_row(2, "Author", PHP_FIXAPI_AUTHOR);
 	php_info_print_table_row(2, "Version", PHP_FIXAPI_VERSION);
 	php_info_print_table_end();
-
-	/* Remove comments if you have entries in php.ini
-	DISPLAY_INI_ENTRIES();
-	*/
 }
 /* }}} */
-
 
 zend_object_value create_fixapi_object(zend_class_entry *class_type TSRMLS_DC)
 {
@@ -138,8 +176,12 @@ zend_object_value create_fixapi_object(zend_class_entry *class_type TSRMLS_DC)
 	memset(intern, 0, sizeof(fixapi_object));
 
 	zend_object_std_init(&intern->std, class_type TSRMLS_CC);
-	object_properties_init(&intern->std, class_type);
-
+	
+	intern->is_connected = 0;
+	MAKE_STD_ZVAL(intern->resource_id);
+	
+	bullsoft_init_properties(intern);
+	
 	retval.handle = zend_objects_store_put(
 	    intern,
 		(zend_objects_store_dtor_t) zend_objects_destroy_object,
@@ -154,7 +196,7 @@ zend_object_value create_fixapi_object(zend_class_entry *class_type TSRMLS_DC)
 void free_fixapi_object(fixapi_object *intern TSRMLS_DC)
 {
 	zend_object_std_dtor(&intern->std TSRMLS_CC);
-	printf("free fixapi object\n");
+	FREE_STD(intern->resource_id);
 	efree(intern);
 }
 
@@ -163,40 +205,136 @@ PHP_METHOD(FixApi, __construct)
 	// printf("__construct");
 }
 
+void log(const char *str)
+{
+	if (PHP_FIXAPI_DEBUG == 1) {
+		MK_STD_INT(mode, 3);
+		MK_STD_STRING(msg, str);
+		MK_STD_STRING(file, "/tmp/test.log");
+		bullsoft_call_func3("error_log", NULL, 3, msg, mode, file);
+		FREE_STD(mode);
+		FREE_STD(msg);
+		FREE_STD(file);
+	}
+}
+
+PHP_METHOD(FixApi, getConnection)
+{
+	zval *object;
+	fixapi_object *intern;
+	object = getThis();
+	intern = (fixapi_object *)zend_object_store_get_object(object TSRMLS_CC);
+	if (Z_TYPE_P(intern->resource_id) != IS_RESOURCE) {
+		RETURN_FALSE;
+	}
+	
+	php_fixapi_descriptor *fdata;
+	ZEND_FETCH_RESOURCE2(
+        fdata,
+		php_fixapi_descriptor*,
+		&(intern->resource_id),
+		-1,
+		PHP_FIXAPI_DESCRIPTOR_RES_NAME,
+		le_fixapi_descriptor,
+		le_fixapi_descriptor_persist
+    );
+	
+	ZVAL_STRING(return_value, fdata->addr, 1);
+}
+
+PHP_METHOD(FixApi, isConnected)
+{
+	zval *object;
+	fixapi_object *intern;
+	object = getThis();
+	intern = (fixapi_object *)zend_object_store_get_object(object TSRMLS_CC);
+	
+	RETURN_BOOL(intern->is_connected);
+}
+
 PHP_METHOD(FixApi, connect)
 {
 	zval *object;
 	fixapi_object *intern;
+	
+	php_fixapi_descriptor *fdata;
+	zend_bool persist = 0;
 
-	if (zend_parse_parameters_none() == FAILURE) {
+	char *addr, *user, *pwd;
+	int addr_len, user_len, pwd_len;
+
+	char *hash_key;
+	int hash_key_len;
+	zend_rsrc_list_entry *existing_rsrc;
+	
+	long handle_conn;
+	
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC,"sss|b", &addr, &addr_len, &user, &user_len, &pwd, &pwd_len, &persist) == FAILURE) {
 		return;
 	}
 
-	MK_STD_INT(mode, 3);
-	MK_STD_STRING(msg, "hello, world\n");
-	MK_STD_STRING(file, "/tmp/test.log");
-
-	bullsoft_call_func3("error_log", NULL, 3, msg, mode, file);
-	bullsoft_call_func1("error_log", NULL, 1, msg);
-
-	MK_STD_ARRAY(arr);
-	add_next_index_long(arr, 1);
-	add_next_index_long(arr, 2);
-
-	MK_STD(retval);
-	bullsoft_call_func1("json_encode", retval, 1, arr);
-	php_var_dump(&retval, 0);
-	// php_printf("asdfasd, %s\n", Z_STRVAL_P(retval));
-
-	MK_STD(retval1);
-	MK_STD_BOOL(assoc, 1);
-	bullsoft_call_func2("json_decode", retval1, 2, retval, assoc);
-	php_var_dump(&retval1, 0);
-	
 	object = getThis();
 	intern = (fixapi_object *)zend_object_store_get_object(object TSRMLS_CC);
-	intern->handle_conn = 1;
-    RETURN_LONG(intern->handle_conn);
+	
+	hash_key_len = spprintf(&hash_key, 0, NCF_FIXAPI_HASH_KEY_PATTERN, addr, user, pwd);
+	printf("hash key: %s\n", hash_key);
+
+	if (zend_hash_find(&EG(persistent_list), hash_key, hash_key_len + 1, (void **)&existing_rsrc) == SUCCESS) {
+		log("there is an exists link here\n");
+		// 存在一个，直接使用！
+		fdata = (php_fixapi_descriptor *) existing_rsrc->ptr;
+		// if (Fix_IsConnect(fdata->handle_conn)) {
+		// @hardcode
+		if (fdata->handle_conn == 1) {
+			ZEND_REGISTER_RESOURCE(intern->resource_id, existing_rsrc->ptr, le_fixapi_descriptor_persist);
+			efree(hash_key);
+			RETURN_TRUE;
+		}
+		zend_hash_del(&EG(persistent_list), hash_key, hash_key_len + 1);
+	}
+
+	log("open a new link here...with...");
+	// Fix_ConnectEx(addr, user, pwd);
+	// @hardcode
+	handle_conn = 1;
+	
+	if (!persist) {
+		log(" non-persist.\n");
+		fdata = (php_fixapi_descriptor *) emalloc(sizeof(php_fixapi_descriptor));
+		fdata->addr = estrndup(addr, addr_len);
+		fdata->user = estrndup(user, user_len);
+		fdata->pwd  = estrndup(pwd, pwd_len);
+		fdata->handle_conn = handle_conn;
+		ZEND_REGISTER_RESOURCE(intern->resource_id, fdata, le_fixapi_descriptor);
+	} else {
+		log(" persist.\n");
+		zend_rsrc_list_entry le;
+		fdata = (php_fixapi_descriptor *)pemalloc(sizeof(php_fixapi_descriptor), 1);
+		
+		fdata->addr = (char *)pemalloc(addr_len + 1, 1);
+		memcpy(fdata->addr, addr, addr_len + 1);
+
+		fdata->user = (char *)pemalloc(user_len + 1, 1);
+		memcpy(fdata->user, user, user_len + 1);
+
+		fdata->pwd = (char *)pemalloc(pwd_len + 1, 1);
+		memcpy(fdata->pwd, pwd, pwd_len + 1);
+
+		fdata->handle_conn = handle_conn;
+
+		// 在EG(regular_list中存一份)
+		ZEND_REGISTER_RESOURCE(intern->resource_id, fdata, le_fixapi_descriptor_persist);
+
+		// 在EG(persistent_list)中再存一份
+		le.type = le_fixapi_descriptor_persist;
+		le.ptr = fdata;
+		
+		zend_hash_update(&EG(persistent_list), hash_key, hash_key_len + 1, (void*)&le, sizeof(zend_rsrc_list_entry), NULL);
+		efree(hash_key);
+	}
+	
+	intern->is_connected = 1;
+	RETURN_TRUE;
 }
 
 

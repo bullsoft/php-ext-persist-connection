@@ -27,6 +27,8 @@ extern zend_module_entry fixapi_module_entry;
 #define PHP_FIXAPI_EXTNAME "fixapi"
 #define PHP_FIXAPI_VERSION "0.1.0"
 #define PHP_FIXAPI_AUTHOR "Gu Weigang<guweigang@ucfgroup.com>"
+#define PHP_FIXAPI_DESCRIPTOR_RES_NAME "wxlc_fixapi_resource_name"
+#define PHP_FIXAPI_DEBUG 1
 
 #include "bullsoft_php.h"
 #include "fixapi.h"
@@ -51,10 +53,18 @@ PHP_RINIT_FUNCTION(fixapi);
 PHP_RSHUTDOWN_FUNCTION(fixapi);
 PHP_MINFO_FUNCTION(fixapi);
 
+typedef struct _php_fixapi_descriptor
+{
+	HANDLE_CONN handle_conn;
+	char *addr;
+	char *user;
+	char *pwd;
+} php_fixapi_descriptor;
+
 typedef struct _fixapi_object {
 	zend_object std;
-	HANDLE_CONN handle_conn;
-	HANDLE_SESSION handle_session;
+	zval *resource_id;
+	zend_bool is_connected;
 } fixapi_object;
 
 zend_object_value create_fixapi_object(zend_class_entry *class_type TSRMLS_DC);
@@ -62,7 +72,9 @@ void free_fixapi_object(fixapi_object* intern TSRMLS_DC);
 
 PHP_METHOD(FixApi, __construct);
 PHP_METHOD(FixApi, connect);
-PHP_METHOD(FixApi, isConnect);
+PHP_METHOD(FixApi, isConnected);
+PHP_METHOD(FixApi, getConnection);
+
 PHP_METHOD(FixApi, setConnEvent);
 PHP_METHOD(FixApi, close);
 PHP_METHOD(FixApi, allocateSession);
